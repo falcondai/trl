@@ -56,6 +56,8 @@ class RolloutGroup:
     tool_mask: list[list[int]]
     tool_call_counts: list[int]
     tool_failure_counts: list[int]
+    truncated: list[bool]
+    num_turns: list[int]
     model_version: int
     queued_at: float = 0.0
 
@@ -70,6 +72,20 @@ class RolloutSample:
     advantage: float
     model_version: int
     metrics: dict[str, float]  # logging metadata only, not used in loss computation
+
+
+@dataclass(slots=True)
+class RolloutCompletion:
+    """Result of a single multi-turn generation for one prompt."""
+
+    completion: Messages
+    completion_ids: list[int]
+    completion_logprobs: list[float]
+    tool_mask: list[int]
+    tool_call_count: int
+    tool_failure_count: int
+    truncated: bool
+    num_turns: int
 
 
 class AsyncRolloutWorker:
@@ -154,6 +170,7 @@ class AsyncRolloutWorker:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.request_timeout = request_timeout
+        self.max_model_len = None
         self.server_timeout = server_timeout
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.log_completions = log_completions
@@ -248,8 +265,8 @@ class AsyncRolloutWorker:
 
     def pause(self) -> None:
         t0 = time.time()
-        # requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
+        # requests.post(f"{self.vllm_server_url}/pause", params={"mode": "abort", "clear_cache": True})
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
@@ -276,7 +293,21 @@ class AsyncRolloutWorker:
         logger.debug(f"[weight_sync] NCCL transfer took {time.time() - t_nccl:.1f}s")
         t_join = time.time()
         t_update.join()
-        logger.debug(f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)")
+        logger.debug(
+            f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)"
+        )
+
+    async def _fetch_max_length_vllm(self):
+        try:
+            client_timeout = aiohttp.ClientTimeout(total=5)
+            async with self.session.get(f"{self.vllm_server_url}/v1/models", timeout=client_timeout) as response:
+                response.raise_for_status()
+                models_info = await response.json()
+            if "data" in models_info and len(models_info["data"]) > 0:
+                self.max_model_len = models_info["data"][0].get("max_model_len")
+                logger.info(f"Fetched max_model_len from vLLM: {self.max_model_len}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch max_model_len from vLLM: {e}")
 
     async def _wait_for_server_ready(
         self,
@@ -292,6 +323,7 @@ class AsyncRolloutWorker:
             try:
                 status_code = await self._get_status_code("/health", 5)
                 if status_code == 200:
+                    await self._fetch_max_length_vllm()
                     logger.info(f"vLLM server ready after {elapsed:.1f}s")
                     return
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
@@ -310,6 +342,7 @@ class AsyncRolloutWorker:
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
         pending_groups: dict[int, RolloutGroup] = {}
         pending_completed: dict[int, int] = {}
+        pending_failures: dict[int, int] = {}
         inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
@@ -344,6 +377,8 @@ class AsyncRolloutWorker:
                             tool_mask=[],
                             tool_call_counts=[],
                             tool_failure_counts=[],
+                            truncated=[],
+                            num_turns=[],
                             model_version=self.model_version,
                         )
                         pending_completed[group_id] = 0
@@ -379,29 +414,52 @@ class AsyncRolloutWorker:
                     group_id, slot = inflight_tasks.pop(task)
                     free_slots.add(slot)
                     logger.debug(f"[slot] freed   slot={slot} group={group_id} free_after={len(free_slots)}")
-                    (
-                        completion,
-                        completion_ids,
-                        completion_logprobs,
-                        tool_mask,
-                        tool_call_count,
-                        tool_failure_count,
-                    ) = task.result()
+
+                    try:
+                        result: RolloutCompletion = task.result()
+                    except Exception:
+                        logger.warning(
+                            f"Generation failed for group {group_id}, marking group as failed",
+                            exc_info=True,
+                        )
+                        pending_failures[group_id] = pending_failures.get(group_id, 0) + 1
+                        pending_completed[group_id] += 1
+                        if pending_completed[group_id] == self.num_generations:
+                            logger.warning(
+                                f"Dropping group {group_id}: "
+                                f"{pending_failures[group_id]}/{self.num_generations} generation(s) failed"
+                            )
+                            del pending_groups[group_id]
+                            del pending_completed[group_id]
+                            del pending_failures[group_id]
+                        continue
+
                     group = pending_groups[group_id]
-                    group.completions.append(completion)
-                    group.completions_ids.append(completion_ids)
-                    group.completions_logprobs.append(completion_logprobs)
-                    group.tool_mask.append(tool_mask)
-                    group.tool_call_counts.append(tool_call_count)
-                    group.tool_failure_counts.append(tool_failure_count)
+                    group.completions.append(result.completion)
+                    group.completions_ids.append(result.completion_ids)
+                    group.completions_logprobs.append(result.completion_logprobs)
+                    group.tool_mask.append(result.tool_mask)
+                    group.tool_call_counts.append(result.tool_call_count)
+                    group.tool_failure_counts.append(result.tool_failure_count)
+                    group.truncated.append(result.truncated)
+                    group.num_turns.append(result.num_turns)
                     # TODO: move this in generation task, shouldn't matter but is correct
-                    self._total_completion_tokens += sum(tool_mask)
+                    self._total_completion_tokens += sum(result.tool_mask)
                     pending_completed[group_id] += 1
 
                     if pending_completed[group_id] == self.num_generations:
-                        group.queued_at = time.monotonic()
-                        await self._groups_to_score.put(group)
-                        logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
+                        if pending_failures.get(group_id, 0) > 0:
+                            logger.warning(
+                                f"Dropping group {group_id}: "
+                                f"{pending_failures[group_id]}/{self.num_generations} generation(s) failed"
+                            )
+                            del pending_failures[group_id]
+                        else:
+                            group.queued_at = time.monotonic()
+                            await self._groups_to_score.put(group)
+                            logger.debug(
+                                f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}"
+                            )
                         del pending_groups[group_id]
                         del pending_completed[group_id]
         finally:
@@ -474,7 +532,9 @@ class AsyncRolloutWorker:
                         if stop_event.is_set():
                             return
                         # Wait for trainer to consume loop
-                        logger.info(f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume...")
+                        logger.info(
+                            f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume..."
+                        )
                         await asyncio.sleep(0.1)
 
             logger.debug(
@@ -493,12 +553,11 @@ class AsyncRolloutWorker:
                 yield group_id, row
             group_id += 1
 
-    async def _generate_one(
-        self, prompt: Messages, tool_dict: dict[str, Callable]
-    ) -> tuple[list[dict[str, str]], list[int], list[float], list[int], int, int]:
+    async def _generate_one(self, prompt: Messages, tool_dict: dict[str, Callable]) -> RolloutCompletion:
         completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
         tool_call_count = 0
         tool_failure_count = 0
+        num_turns = 0
         prompt_ids = self.tokenizer.apply_chat_template(
             prompt,
             return_dict=False,
@@ -507,16 +566,46 @@ class AsyncRolloutWorker:
             chat_template=self.chat_template,
             **self.chat_template_kwargs,
         )
+
+        # Check if the prompt + generation exceeds the max model length
+        max_len = (
+            self.max_model_len if self.max_model_len is not None else getattr(self.tokenizer, "model_max_length", None)
+        )
+        if max_len is not None and len(prompt_ids) + self.max_tokens > max_len:
+            logger.warning(
+                f"Prompt length {len(prompt_ids)} + max_tokens {self.max_tokens} exceeds max_model_len {max_len}. Skipping sample."
+            )
+            return RolloutCompletion(
+                completion=completion,
+                completion_ids=completion_ids,
+                completion_logprobs=completion_logprobs,
+                tool_mask=tool_mask,
+                tool_call_count=tool_call_count,
+                tool_failure_count=tool_failure_count,
+                truncated=True,
+                num_turns=num_turns,
+            )
+
         while True:
             turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
+            num_turns += 1
             completion_ids.extend(turn_ids)
             completion_logprobs.extend(turn_logprobs)
             tool_mask.extend([1] * len(turn_ids))
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None:
-                return completion, completion_ids, completion_logprobs, tool_mask, tool_call_count, tool_failure_count
+                return RolloutCompletion(
+                    completion=completion,
+                    completion_ids=completion_ids,
+                    completion_logprobs=completion_logprobs,
+                    tool_mask=tool_mask,
+                    tool_call_count=tool_call_count,
+                    tool_failure_count=tool_failure_count,
+                    truncated=False,
+                    num_turns=num_turns,
+                )
 
             tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
             tool_call_count += n_calls
@@ -527,6 +616,22 @@ class AsyncRolloutWorker:
             completion_logprobs.extend([0.0] * len(tool_suffix_ids))
             tool_mask.extend([0] * len(tool_suffix_ids))
             prompt_ids = prompt_ids + turn_ids + tool_suffix_ids
+
+            if max_len is not None and len(prompt_ids) + self.max_tokens > max_len:
+                logger.warning(
+                    f"Multi-turn prompt length {len(prompt_ids)} + max_tokens {self.max_tokens} "
+                    f"exceeds max_model_len {max_len}. Stopping generation early."
+                )
+                return RolloutCompletion(
+                    completion=completion,
+                    completion_ids=completion_ids,
+                    completion_logprobs=completion_logprobs,
+                    tool_mask=tool_mask,
+                    tool_call_count=tool_call_count,
+                    tool_failure_count=tool_failure_count,
+                    truncated=True,
+                    num_turns=num_turns,
+                )
 
     def _build_messages_suffix_ids(self, messages: list[dict[str, Any]]) -> list[int]:
         template_messages = [
@@ -657,9 +762,21 @@ class AsyncRolloutWorker:
                         for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
                     },
                     **tm,
+                    "rollout/truncated": float(truncated),
+                    "rollout/num_turns": float(num_turns),
                 },
             )
-            for i, (completion, completion_ids, logprobs, tool_mask, advantage, reward, tm) in enumerate(
+            for i, (
+                completion,
+                completion_ids,
+                logprobs,
+                tool_mask,
+                advantage,
+                reward,
+                tm,
+                truncated,
+                num_turns,
+            ) in enumerate(
                 zip(
                     group.completions,
                     group.completions_ids,
@@ -668,6 +785,8 @@ class AsyncRolloutWorker:
                     advantages,
                     rewards,
                     tool_metrics,
+                    group.truncated,
+                    group.num_turns,
                     strict=True,
                 )
             )
